@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import random_split, DataLoader
 from utils.preprocessing_support import HDF5BrainDataset
+import torch.optim.lr_scheduler as lr_scheduler
 
 # Step 1: Set up argparse
 parser = argparse.ArgumentParser(description="Hyperparameters for the Brain Tumor Segmentation Model")
@@ -60,10 +61,8 @@ LR = lr
 print('lr', lr, LR)
 
 if model_index == 0:
-    model_save_path = 'pairwise_cat.pth'
-elif model_index ==1:
     model_save_path = 'pairwise_cross.pth'
-elif model_index ==2:
+elif model_index ==1:
     model_save_path = 'listwise_cross.pth'
 print('current model', model_save_path)
 
@@ -84,33 +83,45 @@ generator = torch.Generator().manual_seed(42)
 train_dataset, val_dataset = random_split(dataset, [train_size, val_size], generator=generator)
 
 # Create DataLoaders
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-if model_index ==0:
-    from models.ContrastiveModel import PairwiseContrastiveModel,train_pairwise_epoch
-    model = PairwiseContrastiveModel(img_dim=1024, 
-                                    contour_dim=1152,
-                                    hidden_dim=256).to(device)   
-elif model_index ==1:
-    from models.ContrastiveModel import CrossAttnPairwiseModel,train_pairwise_epoch
-    model = CrossAttnPairwiseModel(
-                img_channels=1024,
-                contour_dim=1152,
-                hidden_dim=256,
-                n_heads=4
-            ).to(device)
-elif model_index ==2:
-    from models.ContrastiveModel import CrossAttnListwiseModel,train_lambdarank_epoch
-    model = CrossAttnListwiseModel(hidden_dim=256, n_heads=4).to(device)
+if model_index ==0 or model_index ==1:
+    from models.ContrastiveModel import ListwiseDecoderModel,train_pairwise_epoch,train_lambdarank_epoch,initialize_weights
+    model = ListwiseDecoderModel(
+        img_channels=1024,
+        contour_dim=1152,
+        hidden_dim=256,
+        n_heads=4,
+        num_decoder_layers=3
+    ).to(device)
 
 
-optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, betas=(beta1, beta2), weight_decay=0.00005)
+initialize_weights(model)
+
+# optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=lr, betas=(beta1, beta2), weight_decay=0.00005)
+
+optimizer = AdamW(
+    filter(lambda p: p.requires_grad, model.parameters()),
+    lr=lr,
+    betas=(beta1, beta2),
+    weight_decay=0.00005
+)
+
+# Learning rate scheduler: Reduce LR on plateau
+scheduler = lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=5, verbose=True
+)
+
+
 if para and device_ids:
     print('ids', device_ids)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 if cuda:
     model.cuda()
+if con:
+    # model_load(model,model_save_path )
+    pass
 
 # Initialize best validation loss
 best_val_loss = float('inf')
@@ -118,7 +129,7 @@ best_val_loss = float('inf')
 early_stop = 0
 
 for epoch in range(EPOCH):
-    if model_index ==0 or model_index ==1:
+    if model_index ==0:
         train_loss, test_loss = train_pairwise_epoch(
         model=model,
         optimizer=optimizer,
@@ -128,26 +139,28 @@ for epoch in range(EPOCH):
         num_pairs=K,            # or any other subset size
         lr=lr
          )
-    elif model_index ==2:
+    elif model_index == 1:
         train_loss, test_loss = train_lambdarank_epoch(
             model=model,
             optimizer=optimizer,
             train_dataset=train_loader, 
             test_dataset=val_loader,
             epoch=epoch,        # pass the epoch index
-            K=K,            # or any other subset size
             lr=lr
         )
 
-    if test_loss:
+    if test_loss is not None:
         if test_loss < best_val_loss:
             best_val_loss = test_loss
             if isinstance(model, torch.nn.DataParallel):
                 torch.save(model.module.state_dict(), model_save_path)
             else:
                 torch.save(model.state_dict(), model_save_path)
-            print(f"Model saved at epoch {epoch + 1} with validation loss {test_loss}")
+            print(f"Model saved at epoch {epoch + 1} with validation loss {test_loss:.6f}")
+            early_stop = 0  # Reset early stopping counter
         else:
-            early_stop +=1
-            if early_stop > 5:
+            early_stop += 1
+            print(f"No improvement in validation loss for {early_stop} epochs.")
+            if early_stop > 9:
+                print("Early stopping triggered.")
                 break
