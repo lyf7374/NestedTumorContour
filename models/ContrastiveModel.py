@@ -76,20 +76,27 @@ def pairwise_bce_loss(pred_scores, gt_scores, i_idx, j_idx):
     """
     Pairwise BCE ranking:
      - pred_scores: (N,)
-     - gt_scores: (N,), smaller => better
+     - gt_scores: (N,)
      - i_idx, j_idx: (num_pairs,) random pairs
-       label=1 if i < j => dist(i)<dist(j)
+       label=1 if i outranks j
     """
     dist_i = gt_scores[i_idx]
     dist_j = gt_scores[j_idx]
     s_i = pred_scores[i_idx]
     s_j = pred_scores[j_idx]
 
-    labels = (dist_i < dist_j).float()  # 1 if i better
+    # Now: if dist_i > dist_j, i is "more tumor" -> label=1
+    labels = (dist_i > dist_j).float()
+    
     delta = s_i - s_j
-    p_ij = torch.sigmoid(delta)  # probability i < j
-    bce = -(labels * torch.log(p_ij+1e-8) + (1-labels)*torch.log(1-p_ij+1e-8))
+    p_ij = torch.sigmoid(delta)  # Probability that i outranks j
+
+    bce = -(
+        labels * torch.log(p_ij + 1e-8)
+        + (1 - labels) * torch.log(1 - p_ij + 1e-8)
+    )
     return bce.mean()
+
 
 #############################################################
 # 2) Transformer Decoder Model (ListwiseDecoderModel)
