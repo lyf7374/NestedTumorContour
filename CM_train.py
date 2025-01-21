@@ -114,14 +114,16 @@ scheduler = lr_scheduler.ReduceLROnPlateau(
 )
 
 
+if con:
+    dic_pth = model_save_path
+    state_dict = torch.load(dic_pth, map_location=torch.device('cpu'))
+    model.load_state_dict(state_dict, strict=False)
 if para and device_ids:
     print('ids', device_ids)
     model = torch.nn.DataParallel(model, device_ids=device_ids)
 if cuda:
     model.cuda()
-if con:
-    # model_load(model,model_save_path )
-    pass
+
 
 # Initialize best validation loss
 best_val_loss = float('inf')
