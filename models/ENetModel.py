@@ -209,8 +209,7 @@ class ENetSimple(nn.Module):
         
         # Output layer to produce probability
         self.output_layer = nn.Sequential(
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, 1)
         )
     
     def forward(self, img, contour_emb_i, contour_emb_j):
@@ -277,8 +276,7 @@ class ENet(nn.Module):
             nn.Linear(2 * hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, image_emb, contour_emb_i, contour_emb_j):
@@ -309,28 +307,524 @@ class ENet(nn.Module):
         combined = torch.cat([g_i_rep, g_j_rep], dim=1)  # (B, 2 * hidden_dim)
         
         # Compute probability
-        prob = self.score_head(combined).squeeze(-1)    # (B,)
-        return prob
+        score = self.score_head(combined).squeeze(-1)    # (B,)
+
+        return score,score
     
+
+
+class ENet_v2(nn.Module):
+    """
+    Evaluation Network (ENet) that takes two contour embeddings and an image embedding,
+    and predicts the probability that g_i is better than g_j.
+
+    Inputs:
+        image_emb: (B, C, D, H, W)
+        contour_emb_i: (B, contour_dim)
+        contour_emb_j: (B, contour_dim)
+    Output:
+        prob: (B,)
+    """
+    def __init__(self,
+                 img_channels=1024,
+                 contour_dim=1152,
+                 hidden_dim=256,
+                 n_heads=4,
+                 num_decoder_layers=3):
+        super().__init__()
+        self.img_proj = nn.Linear(img_channels, hidden_dim)
+        self.contour_proj = nn.Linear(contour_dim, hidden_dim)
+        
+        self.layers = nn.ModuleList([
+            DecoderLayer(hidden_dim=hidden_dim, n_heads=n_heads)
+            for _ in range(num_decoder_layers)
+        ])
+        
+        # After processing, we'll concatenate the representations of g_i and g_j
+        self.score_head = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+        # After processing, we'll concatenate the representations of g_i and g_j
+        self.prob_head = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, 1)
+        )
+
+    def forward(self, image_emb, contour_emb_i, contour_emb_j):
+        """
+        image_emb: (B, 1024, 4, 4, 4)
+        contour_emb_i: (B, 1152)
+        contour_emb_j: (B, 1152)
+        => prob: (B,)
+        """
+        B, C, D, H, W = image_emb.shape
+        # Flatten image embeddings => (B, 64, 1024)
+        img_tokens = image_emb.view(B, C, D * H * W).transpose(1, 2)  # (B, 64, 1024)
+        img_tokens = self.img_proj(img_tokens)                        # (B, 64, hidden_dim)
+        
+        # Project contour embeddings => (B, 2, hidden_dim)
+        contour_emb = torch.stack([contour_emb_i, contour_emb_j], dim=1)  # (B, 2, contour_dim)
+        contour_tokens = self.contour_proj(contour_emb)                   # (B, 2, hidden_dim)
+        
+        # Pass through Transformer decoder layers
+        for layer in self.layers:
+            contour_tokens = layer(contour_tokens, img_tokens)            # (B, 2, hidden_dim)
+        
+        # Extract the representations for g_i and g_j
+        g_i_rep = contour_tokens[:, 0, :]  # (B, hidden_dim)
+        g_j_rep = contour_tokens[:, 1, :]  # (B, hidden_dim)
+        
+        # Concatenate representations
+        combined = torch.cat([g_i_rep, g_j_rep], dim=1)  # (B, 2 * hidden_dim)
+        
+        # Compute probability
+        score = self.score_head(combined).squeeze(-1)    # (B,)
+        prob = self.prob_head(combined).squeeze(-1)    # (B,) 
+        return score,prob
+
+
+
+def get_target_distance(si, sj):
+    """
+    si, sj in {0,1} or partial in (0,1).
+    Return the "desired" distance.
+      1) (1,1) or (0,0) => 0
+      2) (1,0) or (0,1) => 1
+      3) (1,d) => (1 - d)
+      4) (0,d) => d
+      5) (d1,d2) => |d1 - d2|
+    """
+    # both absolute same
+    if (si == 0.0 and sj == 0.0) or (si == 1.0 and sj == 1.0):
+        return 0.0
+    # both absolute mismatch
+    if (si == 0.0 and sj == 1.0) or (si == 1.0 and sj == 0.0):
+        return 1.0
+    
+    # one absolute, one partial
+    if si == 1.0 and (0 < sj < 1.0):
+        return 1.0 - sj
+    if sj == 1.0 and (0 < si < 1.0):
+        return 1.0 - si
+    if si == 0.0 and (0 < sj < 1.0):
+        return sj
+    if sj == 0.0 and (0 < si < 1.0):
+        return si
+    
+    # both partial => difference
+    return abs(si - sj)
+
+def custom_contrastive_loss(dist_pred, score_i, score_j):
+    """
+    dist_pred: (P,) predicted distances
+    score_i, score_j: (P,) each in {0,1} or partial in (0,1)
+    We'll compute an MSE with the 'target distance' from get_target_distance.
+    """
+    device = dist_pred.device
+
+    # build a list of target distances
+    dist_targets = []
+    # we must do this on CPU numpy or do it in a vectorized way on GPU
+    # for simplicity, we do a loop:
+    si_np = score_i.detach().cpu().numpy()
+    sj_np = score_j.detach().cpu().numpy()
+
+    for s_i, s_j in zip(si_np, sj_np):
+        dist_targets.append(get_target_distance(s_i, s_j))
+    
+    dist_targets = torch.tensor(dist_targets, device=device, dtype=torch.float32)
+    
+    # MSE
+    loss = F.mse_loss(dist_pred, dist_targets)
+    return loss
+
+
+def sample_pairs_no_diagonal(N, num_pairs, device='cpu'):
+    """
+    Samples 'num_pairs' valid (i, j) with i != j from range(N).
+    Returns tensors (i_idx, j_idx).
+    """
+    # 1. All indices from 0 to N*N - 1
+    all_idx = torch.arange(N * N, device=device)
+
+    # 2. Build a mask for diagonal entries (where i_idx == j_idx)
+    #    i == j if floor_div == modulo
+    mask_diagonal = (all_idx // N) == (all_idx % N)
+
+    # 3. Filter out diagonal indices
+    valid_idx = all_idx[~mask_diagonal]
+
+    # 4. Randomly sample from valid_idx
+    chosen = valid_idx[torch.randint(0, valid_idx.shape[0], (num_pairs,), device=device)]
+
+    # 5. Convert back to (i_idx, j_idx)
+    i_idx = chosen // N
+    j_idx = chosen % N
+    return i_idx, j_idx
+
+def train_contrastive_epoch(
+    model,
+    optimizer,
+    train_dataset,
+    test_dataset,
+    epoch,
+    lr=1e-4,
+    num_pairs=512
+):
+    """
+    Train one epoch using margin-based contrastive loss.
+    
+    Args:
+        model: ContrastiveENet or similar.
+        optimizer: torch optimizer (Adam, etc.)
+        train_dataset, test_dataset: Iterables of data items
+        epoch: current epoch index
+        num_pairs: number of random pairs to sample per data item
+        margin: the margin for dissimilar pairs
+    """
+    start_time = time.time()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
+
+    total_loss = 0.0
+    total_batches = 0
+
+    # ------------- TRAIN -------------
+    for data_item in train_dataset:
+        # 1) Load data
+        # Suppose get_image_and_contours returns:
+        #   image_emb: (1,1024,4,4,4) or (1024,4,4,4)
+        #   all_g_embs: (N, 1152)
+        #   all_scores: (N,) in {0,1} or partial
+        image_emb, all_g_embs, all_scores = get_image_and_contours(data_item)
+        if len(image_emb.shape) == 4:
+            image_emb = image_emb.unsqueeze(0)  # => (1,1024,4,4,4)
+
+        image_emb = image_emb.to(device)
+        all_g_embs = all_g_embs.to(device)
+        all_scores = all_scores.to(device)
+
+        N = all_scores.shape[0]
+        if N < 2:
+            continue
+        
+        # 2) Sample random pairs
+        pair_indices = torch.randint(low=0, high=N*N, size=(num_pairs,), device=device)
+        i_idx = pair_indices // N
+        j_idx = pair_indices % N
+
+        # 3) Build "similar vs. dissimilar" labels
+        #    Example: label=1 if score_i==score_j, else 0
+        score_i = all_scores[i_idx]
+        score_j = all_scores[j_idx]
+
+
+        # 4) Gather contour embeddings
+        g_i = all_g_embs[i_idx]
+        g_j = all_g_embs[j_idx]
+
+        # repeat image => (P,1024,4,4,4)
+        image_batch = image_emb.repeat(g_i.size(0), 1, 1, 1, 1)
+
+        # forward => dist_pred => (P,)
+        dist_pred,_ = model(image_batch, g_i, g_j)
+
+        # custom contrastive loss => MSE to the 'desired distance'
+        loss_val = custom_contrastive_loss(dist_pred, score_i, score_j)
+
+        optimizer.zero_grad()
+        loss_val.backward()
+        optimizer.step()
+
+        total_loss += loss_val.item()
+        total_batches += 1
+
+    avg_train_loss = total_loss / max(total_batches, 1)
+    print(f"[Epoch {epoch+1}] Train Contrastive Loss = {avg_train_loss:.6f}")
+
+    test_loss = None
+    # ------------- TEST / EVAL -------------
+    if (epoch+1) % 10 == 0:
+        # Evaluate every 5 epochs
+        model.eval()
+        total_test_loss = 0.0
+        test_batches = 0
+
+        with torch.no_grad():
+            for val_item in test_dataset:
+                image_emb, all_g_embs, all_scores = get_image_and_contours(val_item)
+                if len(image_emb.shape) == 4:
+                    image_emb = image_emb.unsqueeze(0)
+                
+                image_emb = image_emb.to(device)
+                all_g_embs = all_g_embs.to(device)
+                all_scores = all_scores.to(device)
+
+                N_test = all_scores.shape[0]
+                if N_test < 2:
+                    continue
+                
+                pair_indices_test = torch.randint(low=0, high=N_test*N_test, size=(num_pairs,), device=device)
+                i_idx_test = pair_indices_test // N_test
+                j_idx_test = pair_indices_test % N_test
+
+                score_i_test = all_scores[i_idx_test]
+                score_j_test = all_scores[j_idx_test]
+
+                g_i_test = all_g_embs[i_idx_test]
+                g_j_test = all_g_embs[j_idx_test]
+
+                image_batch_test = image_emb.repeat(g_i_test.size(0), 1, 1, 1, 1)
+                
+                dist_test,_ = model(image_batch_test, g_i_test, g_j_test)
+                loss_test_val = custom_contrastive_loss(dist_test, score_i_test, score_j_test)
+
+                total_test_loss  += loss_test_val.item()
+                test_batches += 1
+
+            test_loss = total_test_loss  / max(test_batches,1)
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"# # # # Evaluation for Epoch {epoch+1} completed in {elapsed:.2f}s # # # #")
+            print(f"# # # #  Test Contrastive Loss = {test_loss:.6f} # # # #")
+    
+    return avg_train_loss, test_loss
+
+def train_contrastive_ranking_epoch(
+    model,
+    optimizer,
+    train_dataset,
+    test_dataset,
+    epoch,
+    lr=1e-4,
+    num_pairs=512,
+    # Hyperparameters to optionally weight ranking loss by pair type:
+    alpha = 0.5, 
+    lambda_A=0.0,      # (1,1) or (0,0) – no ranking loss
+    lambda_B=1.0,      # (1,0) or (0,1)
+    lambda_C=1.0,      # (1,d) or (d,1)
+    lambda_D=1.0       # (d1,d2)
+):
+    """
+    Train one epoch using a combined contrastive (MSE) loss and an auxiliary ranking loss.
+    
+    For each data item:
+      - Sample random pairs of contours.
+      - Compute the predicted distance (dist_pred) via the model.
+      - Compute the target distance using get_target_distance.
+      - Compute an MSE loss between dist_pred and the target distance.
+      - Also compute a binary ranking target (1 if score_i > score_j, else 0)
+        and a per-sample ranking loss via binary cross-entropy.
+      - The ranking loss is weighted by a per-sample lambda that depends on the pair type:
+          * Type A: (1,1) or (0,0) -> λ = lambda_A (usually 0)
+          * Type B: (1,0) or (0,1) -> λ = lambda_B
+          * Type C: (1,d) or (d,1) -> λ = lambda_C
+          * Type D: (d1,d2)         -> λ = lambda_D
+      - The final loss is: loss_total = MSE_loss + (weighted average ranking loss).
+    
+    Returns:
+        (avg_train_loss, test_loss) for the epoch.
+    """
+
+    start_time = time.time()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.train()
+
+    total_loss = 0.0
+    total_batches = 0
+
+    for data_item in train_dataset:
+        # 1) Load data
+        image_emb, all_g_embs, all_scores = get_image_and_contours(data_item)
+        if len(image_emb.shape) == 4:
+            image_emb = image_emb.unsqueeze(0)  # (1,1024,4,4,4)
+        image_emb = image_emb.to(device)
+        all_g_embs = all_g_embs.to(device)
+        all_scores = all_scores.to(device)
+        N = all_scores.shape[0]
+        if N < 2:
+            continue
+
+        # 2) Sample random pairs
+        # pair_indices = torch.randint(low=0, high=N * N, size=(num_pairs,), device=device)
+        # i_idx = pair_indices // N
+        # j_idx = pair_indices % N
+        i_idx, j_idx = sample_pairs_no_diagonal(N, num_pairs, device=device)
+        # 3) Get scores for each pair and compute ranking target (1 if score_i > score_j, else 0)
+        score_i = all_scores[i_idx]
+        score_j = all_scores[j_idx]
+        ranking_target = (score_i > score_j).float()  # (P,)
+
+        # 4) Get contour embeddings for each pair
+        g_i = all_g_embs[i_idx]
+        g_j = all_g_embs[j_idx]
+
+        # Repeat image embedding for each pair: (P,1024,4,4,4)
+        image_batch = image_emb.repeat(g_i.size(0), 1, 1, 1, 1)
+
+        # 5) Forward pass: model returns predicted distance (in [0,1])
+        dist_pred,prob_pred = model(image_batch, g_i, g_j)  # (P,)
+
+        # 6) Compute target distances (contrastive/regression target)
+        dist_targets = []
+        si_np = score_i.detach().cpu().numpy()
+        sj_np = score_j.detach().cpu().numpy()
+        for s_i, s_j in zip(si_np, sj_np):
+            dist_targets.append(get_target_distance(s_i, s_j))
+        dist_targets = torch.tensor(dist_targets, device=device, dtype=torch.float32)
+
+        mse_loss = F.mse_loss(dist_pred, dist_targets)
+
+        # 7) Build masks for each ranking type:
+        # Type A: (1,1) or (0,0)
+        mask_A = ((score_i == 0.0) & (score_j == 0.0)) | ((score_i == 1.0) & (score_j == 1.0))
+        # Type B: (1,0) or (0,1)
+        mask_B = ((score_i == 1.0) & (score_j == 0.0)) | ((score_i == 0.0) & (score_j == 1.0))
+        # Type C: one absolute and one partial: (1,d) or (d,1)
+        mask_C = ((score_i == 1.0) & (score_j > 0.0) & (score_j < 1.0)) | \
+                 ((score_j == 1.0) & (score_i > 0.0) & (score_i < 1.0))
+        # Type D: both partial (in (0,1))
+        mask_D = ((score_i > 0.0) & (score_i < 1.0) & (score_j > 0.0) & (score_j < 1.0))
+
+        # Build a lambda tensor of shape (P,) with appropriate weight for each pair.
+        lambda_tensor = torch.zeros_like(score_i, dtype=torch.float32)
+        lambda_tensor[mask_A] = lambda_A
+        lambda_tensor[mask_B] = lambda_B
+        lambda_tensor[mask_C] = lambda_C
+        lambda_tensor[mask_D] = lambda_D
+
+        # Define overall ranking mask as pairs that are not type A (since Type A gets lambda 0)
+        mask_ranking = (lambda_tensor > 0)
+
+        # 8) Compute per-sample ranking loss (BCE with reduction='none')
+        # Note: We use F.binary_cross_entropy with reduction='none' to get a loss per pair.
+        ranking_loss_all = F.binary_cross_entropy_with_logits(prob_pred, ranking_target, reduction='none')
+        
+        # Compute the weighted average ranking loss only over pairs that are selected.
+        if mask_ranking.sum() > 0:            
+            ranking_loss = (ranking_loss_all[mask_ranking] * lambda_tensor[mask_ranking]).sum() / score_i.size(0)
+        else:
+            ranking_loss = 0.0
+
+        # 9) Combine losses
+        loss_val = (1-alpha)*mse_loss + alpha * ranking_loss  # (ranking loss now already weighted per sample)
+
+        optimizer.zero_grad()
+        loss_val.backward()
+        optimizer.step()
+
+        total_loss += loss_val.item()
+        total_batches += 1
+
+    avg_train_loss = total_loss / max(total_batches, 1)
+    print(f"[Epoch {epoch+1}] Train Combined Loss = {avg_train_loss:.6f} | MSE  {mse_loss:.6f} | rank  {ranking_loss:.6f}")
+
+
+
+    test_loss = None
+    if (epoch + 1) % 10 == 0:
+        model.eval()
+        total_test_loss = 0.0
+        test_batches = 0
+        ranking_record = 0.0
+        mse_record = 0.0
+
+        with torch.no_grad():
+            for val_item in test_dataset:
+                image_emb, all_g_embs, all_scores = get_image_and_contours(val_item)
+                if len(image_emb.shape) == 4:
+                    image_emb = image_emb.unsqueeze(0)
+                image_emb = image_emb.to(device)
+                all_g_embs = all_g_embs.to(device)
+                all_scores = all_scores.to(device)
+                N_test = all_scores.shape[0]
+                if N_test < 2:
+                    continue
+                
+                # pair_indices_test = torch.randint(low=0, high=N_test * N_test, size=(num_pairs,), device=device)
+                # i_idx_test = pair_indices_test // N_test
+                # j_idx_test = pair_indices_test % N_test
+
+                i_idx_test, j_idx_test = sample_pairs_no_diagonal(N_test, num_pairs, device=device)
+                score_i_test = all_scores[i_idx_test]
+                score_j_test = all_scores[j_idx_test]
+                ranking_target_test = (score_i_test > score_j_test).float()
+
+                g_i_test = all_g_embs[i_idx_test]
+                g_j_test = all_g_embs[j_idx_test]
+                image_batch_test = image_emb.repeat(g_i_test.size(0), 1, 1, 1, 1)
+                dist_test, prob_test = model(image_batch_test, g_i_test, g_j_test)
+
+                # Compute target distances
+                dist_targets_test = []
+                si_np_test = score_i_test.detach().cpu().numpy()
+                sj_np_test = score_j_test.detach().cpu().numpy()
+                for s_i, s_j in zip(si_np_test, sj_np_test):
+                    dist_targets_test.append(get_target_distance(s_i, s_j))
+                dist_targets_test = torch.tensor(dist_targets_test, device=device, dtype=torch.float32)
+                mse_loss_test = F.mse_loss(dist_test, dist_targets_test)
+
+                # Build masks for test pairs
+                mask_A_test = ((score_i_test == 0.0) & (score_j_test == 0.0)) | ((score_i_test == 1.0) & (score_j_test == 1.0))
+                mask_B_test = ((score_i_test == 1.0) & (score_j_test == 0.0)) | ((score_i_test == 0.0) & (score_j_test == 1.0))
+                mask_C_test = ((score_i_test == 1.0) & (score_j_test > 0.0) & (score_j_test < 1.0)) | \
+                              ((score_j_test == 1.0) & (score_i_test > 0.0) & (score_i_test < 1.0))
+                mask_D_test = ((score_i_test > 0.0) & (score_i_test < 1.0) & (score_j_test > 0.0) & (score_j_test < 1.0))
+                lambda_tensor_test = torch.zeros_like(score_i_test, dtype=torch.float32)
+                lambda_tensor_test[mask_A_test] = lambda_A
+                lambda_tensor_test[mask_B_test] = lambda_B
+                lambda_tensor_test[mask_C_test] = lambda_C
+                lambda_tensor_test[mask_D_test] = lambda_D
+                mask_ranking_test = (lambda_tensor_test > 0)
+
+                ranking_loss_all_test = F.binary_cross_entropy_with_logits(prob_test, ranking_target_test, reduction='none')
+                if mask_ranking_test.sum() > 0:
+                    ranking_loss_test = (ranking_loss_all_test[mask_ranking_test] * lambda_tensor_test[mask_ranking_test]).sum() /  score_i_test.size(0)
+                else:
+                    ranking_loss_test = 0.0
+
+                loss_test_val = (1-alpha)*mse_loss_test + alpha * ranking_loss_test
+                
+                total_test_loss += loss_test_val.item()
+                ranking_record  += ranking_loss_test.item()
+                mse_record  += mse_loss_test.item()
+                test_batches += 1
+
+            test_loss = total_test_loss / max(test_batches, 1)
+            rank_avg_loss = ranking_record / max(test_batches, 1)
+            mse_avg_loss = mse_record / max(test_batches, 1)
+
+            end_time = time.time()
+            elapsed = end_time - start_time
+            print(f"# # # # Evaluation for Epoch {epoch+1} completed in {elapsed:.2f}s # # # #")
+            print(f"# # # # Test Combined Loss = {test_loss:.6f} # # # #")
+            print(f"# # # # Current test mse {mse_avg_loss:.6f} |  ranking {rank_avg_loss:.6f} # # # #")
+    return avg_train_loss, test_loss
+
+
+
 def train_neighbourwise_epoch(
     model,
     optimizer,
     train_dataset,
     test_dataset,
     epoch,
-    lr=1e-4
+    lr=1e-4,
+    skip_equal = False
 ):
     """
-    Trains `ENet` or `ENetSimple` for one epoch using neighbor-wise pairs from exactly 150 contours.
-
-    For each data_item in train_dataset:
-      1. Load image_emb (1,1024,4,4,4) and 150 contour_embs (150,1152), plus scores (150,).
-      2. Generate consecutive pairs (i, i+1) => total 149 pairs.
-      3. Model forward => probability p_{i,i+1} for each pair.
-      4. Compare p_{i,i+1} to the label (scores[i] > scores[i+1] => 1 else 0).
-      5. Accumulate BCE loss, backprop, optimizer step.
-
-    Evaluation is done every 10 epochs, using the same neighbor-wise approach on test_dataset.
+    Trains `ENet` or `ENetSimple` for one epoch using neighbor-wise pairs from the dataset.
+    If `loop=True`, then we do per-pair forward/backward in a loop (like train_neighbourwise_epoch_loop).
+    If `loop=False`, we do a single batched forward/backward for all pairs (like train_neighbourwise_epoch).
+    Evaluation is done every 10 epochs.
 
     Args:
         model: either `ENet` (requires image_emb) or `ENetSimple` (ignores image_emb).
@@ -338,8 +832,7 @@ def train_neighbourwise_epoch(
         train_dataset, test_dataset: Iterable data sources.
         epoch: current epoch number (0-based).
         lr: learning rate (optional, typically set in optimizer init).
-        device: torch device (CPU/GPU). Autodetect if None.
-
+        loop: if True, do a loop-based approach (pair by pair), otherwise a batched approach.
     Returns:
         (avg_train_loss, test_loss_if_any)
     """
@@ -349,58 +842,70 @@ def train_neighbourwise_epoch(
 
     start_time = time.time()
     epoch_loss = 0.0
-    num_items = 0
+    num_pairs = 0  # We'll track how many neighbor pairs were processed
 
     # --- Training ---
     for data_item in train_dataset:
         # 1) Load data
+        #    get_image_and_contours_neighbour is presumably a function that returns:
+        #    image_emb: shape (1, 1024,4,4,4) or (1024,4,4,4)
+        #    all_g_embs: shape (N, 1152)
+        #    all_scores: shape (N,)
         image_emb, all_g_embs, all_scores = get_image_and_contours_neighbour(data_item)
-        # image_emb : (1024,4,4,4)  or sometimes (1,1024,4,4,4) => ensure shape
-        # all_g_embs: (150, 1152)
-        # all_scores: (150,)
-
         N = all_scores.shape[0]
         if N < 2:
             continue
 
-        # Move to device
-        # If using ENet (with image), we keep shape (B=1, 1024,4,4,4):
         if len(image_emb.shape) == 4:
+            # make sure image_emb has batch=1
             image_emb = image_emb.unsqueeze(0)  # => (1,1024,4,4,4)
-        image_emb = image_emb.to(device)
 
+        image_emb = image_emb.to(device)
         all_g_embs = all_g_embs.to(device)
         all_scores = all_scores.to(device)
 
-        # 2) Create neighbor pairs (0,1), (1,2), ..., (N-2, N-1)
-        i_idx = torch.arange(N-1, device=device)
-        j_idx = i_idx + 1  # shape (N-1,)
+        # 2) Neighbor pairs: (0,1), (1,2), ..., (N-2, N-1)
+        pair_perm = torch.randperm(N - 1, device=device)
+        pre_i_idx = pair_perm
+        pre_j_idx = pair_perm + 1  # be sure not to exceed N-1
 
-        # 3) Gather embeddings for these pairs
-        # shape => (N-1, 1152)
-        g_i = all_g_embs[i_idx]
-        g_j = all_g_embs[j_idx]
+        # 3) Randomly flip each pair with 50% probability
+        flip_mask = torch.rand(pre_i_idx.size(0), device=device) < 0.5  # (N-1,)
+        i_idx = torch.where(flip_mask, pre_i_idx, pre_j_idx)  # If flip_mask=True, keep i; else j
+        j_idx = torch.where(flip_mask, pre_j_idx, pre_i_idx)  # If flip_mask=True, keep j; else i
 
-        # 4) Construct binary labels: 1 if scores[i] > scores[j], else 0
-        labels = (all_scores[i_idx] > all_scores[j_idx]).float()  # shape (N-1,)
 
-        # 5) Forward pass
-  
-        image_batch = image_emb.repeat(g_i.size(0), 1, 1, 1, 1)  # => (N-1, 1024,4,4,4)
-        pred_probs = model(image_batch, g_i, g_j)  # => (N-1,)
- 
+        if skip_equal:
+            # 3) Skip pairs where the scores are equal
+            score_i = all_scores[i_idx]
+            score_j = all_scores[j_idx]
+            valid_mask =  (score_i != score_j)
+            
+            i_idx = i_idx[valid_mask]
+            j_idx = j_idx[valid_mask]
+        if i_idx.size(0) == 0:
+            continue
 
-        # 6) Compute BCE loss
-        loss_val = F.binary_cross_entropy(pred_probs, labels)
+        # -- Batched approach (all neighbor pairs in one pass) --
+        g_i = all_g_embs[i_idx]  # (N-1,1152)
+        g_j = all_g_embs[j_idx]  # (N-1,1152)
+        labels = (all_scores[i_idx] > all_scores[j_idx]).float()  # (N-1,)
 
+        # Expand image batch to match (N-1) pairs
+        image_batch = image_emb.repeat(g_i.size(0), 1, 1, 1, 1)  # => (N-1,1024,4,4,4)
+        pred_probs,_ = model(image_batch, g_i, g_j)  # => (N-1,)
+
+        loss_val = F.binary_cross_entropy_with_logits(pred_probs, labels)
         optimizer.zero_grad()
         loss_val.backward()
         optimizer.step()
 
-        epoch_loss += loss_val.item()
-        num_items += 1
 
-    avg_train_loss = epoch_loss / max(num_items, 1)
+        epoch_loss += loss_val.item()
+        # number of pairs processed
+        num_pairs += 1
+
+    avg_train_loss = epoch_loss / max(num_pairs, 1)
     print(f"[Epoch {epoch+1}] Train Loss = {avg_train_loss:.6f}")
 
     # --- Evaluation every 10 epochs ---
@@ -427,7 +932,16 @@ def train_neighbourwise_epoch(
                 # neighbor pairs
                 i_idx_test = torch.arange(N_test - 1, device=device)
                 j_idx_test = i_idx_test + 1
-
+                if skip_equal:
+                    # 3) Skip pairs where the scores are equal
+                    score_i = all_scores[i_idx_test]
+                    score_j = all_scores[j_idx_test]
+                    valid_mask_test =  (score_i != score_j)
+                    
+                    i_idx_test = i_idx_test[valid_mask_test]
+                    j_idx_test = j_idx_test[valid_mask_test]
+                if i_idx_test.size(0) == 0:
+                    continue
                 g_i_test = all_g_embs[i_idx_test]
                 g_j_test = all_g_embs[j_idx_test]
 
@@ -435,9 +949,9 @@ def train_neighbourwise_epoch(
 
          
                 image_batch_test = image_emb.repeat(g_i_test.size(0), 1, 1, 1, 1)
-                pred_test_probs = model(image_batch_test, g_i_test, g_j_test)
+                pred_test_probs,_ = model(image_batch_test, g_i_test, g_j_test)
     
-                loss_test_val = F.binary_cross_entropy(pred_test_probs, labels_test)
+                loss_test_val = F.binary_cross_entropy_with_logits(pred_test_probs, labels_test)
                 total_test_loss += loss_test_val.item()
                 num_test_items += 1
 
@@ -458,99 +972,94 @@ def train_randompairs_epoch(
     test_dataset,
     epoch,
     num_pairs=512,
-    lr=1e-4
+    lr=1e-4,
+    loop=False,
+    skip_equal = True
 ):
     """
-    Trains `ENet` or `ENetSimple` for one epoch using random pairwise comparisons from 800 contours.
-
-    For each data_item in train_dataset:
-      1. Load image_emb (1,1024,4,4,4) and 800 contour_embs (800,1152), plus scores (800,).
-      2. Sample random pairs (i_idx, j_idx).
-      3. Model forward => probability p_{i,j}.
-      4. Compare p_{i,j} to label (scores[i]>scores[j]?).
-      5. BCE loss, backprop, optimizer step.
-
-    Evaluates every 10 epochs similarly with random pairs on the test set.
+    Trains `ENet` or `ENetSimple` for one epoch using random pairwise comparisons from the dataset.
+    If `loop=True`, we do a per-pair forward/backward (as in train_randompairs_epoch_loop).
+    If `loop=False`, we do a single batched forward/backward (as in train_randompairs_epoch).
+    Evaluates every 10 epochs using the same random-pair approach.
 
     Args:
-        model: either `ENet` (needs image_emb) or `ENetSimple` (ignores image_emb).
-        optimizer: torch optimizer.
-        train_dataset, test_dataset: Iterable data sources.
-        epoch: current epoch number (0-based).
-        num_pairs: how many pairs to sample per data_item.
-        lr: learning rate.
-        device: torch device (CPU/GPU). Autodetect if None.
-
+        model: ENet or ENetSimple instance.
+        optimizer: torch optimizer (e.g., Adam).
+        train_dataset, test_dataset: Iterable of data items.
+        epoch: current epoch index (0-based).
+        num_pairs: number of random pairs to sample per data_item (default 512).
+        lr: learning rate (set in optimizer or here).
+        loop: if True, do a loop-based approach. If False, a batched approach.
     Returns:
         (avg_train_loss, test_loss_if_any)
     """
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.train()
 
     start_time = time.time()
-    epoch_loss = 0.0
-    num_items = 0
+    total_loss = 0.0
+    total_pairs = 0
 
     # --- Training ---
     for data_item in train_dataset:
         # 1) Load data
+        #    get_image_and_contours is presumably a function that returns:
+        #    image_emb: shape (1,1024,4,4,4) or (1024,4,4,4)
+        #    all_g_embs: shape (N, 1152)
+        #    all_scores: shape (N,)
         image_emb, all_g_embs, all_scores = get_image_and_contours(data_item)
-        N = all_scores.shape[0]  # Expect 800 typically
-
+        N = all_scores.shape[0]
         if N < 2:
             continue
 
         if len(image_emb.shape) == 4:
             image_emb = image_emb.unsqueeze(0)  # => (1,1024,4,4,4)
-        image_emb = image_emb.to(device)
 
+        image_emb = image_emb.to(device)
         all_g_embs = all_g_embs.to(device)
         all_scores = all_scores.to(device)
 
-        # 2) Randomly sample `num_pairs` pairs
-        # Each pair_indices[k] is in [0, N*N)
-        pair_indices = torch.randint(
-            low=0, high=N*N, size=(num_pairs,), device=device
-        )
+        # 2) Sample random pairs
+        pair_indices = torch.randint(low=0, high=N*N, size=(num_pairs,), device=device)
         i_idx = pair_indices // N
         j_idx = pair_indices % N
 
-        # optionally ensure i_idx != j_idx
-        valid_mask = (i_idx != j_idx)
-        i_idx = i_idx[valid_mask]
-        j_idx = j_idx[valid_mask]
+        # 3) Skip pairs where the scores are equal
 
-        # gather embeddings
-        g_i = all_g_embs[i_idx]
-        g_j = all_g_embs[j_idx]
-
-        # gather labels
-        labels = (all_scores[i_idx] > all_scores[j_idx]).float()
-
-        if labels.shape[0] == 0:
+        if skip_equal:
+            # 3) Skip pairs where the scores are equal
+            score_i = all_scores[i_idx]
+            score_j = all_scores[j_idx]
+            valid_mask = (score_i != score_j)
+            
+            i_idx = i_idx[valid_mask]
+            j_idx = j_idx[valid_mask]
+        if i_idx.size(0) == 0:
             continue
 
-        # 3) Forward pass
- 
-        image_batch = image_emb.repeat(labels.size(0), 1, 1, 1, 1)
-        pred_probs = model(image_batch, g_i, g_j)  # => (P,)
 
+        # -- Batched approach --
+        if i_idx.numel() == 0:
+            continue  # no valid pairs
+        g_i = all_g_embs[i_idx]  # shape => (P,1152)
+        g_j = all_g_embs[j_idx]  # shape => (P,1152)
+        labels = (all_scores[i_idx] > all_scores[j_idx]).float()  # (P,)
 
-        # 4) Compute BCE
-        loss_val = F.binary_cross_entropy(pred_probs, labels)
+        image_batch = image_emb.repeat(labels.size(0), 1, 1, 1, 1)  # => (P,1024,4,4,4)
+        pred_probs,_ = model(image_batch, g_i, g_j)  # => (P,)
+
+        loss_val = F.binary_cross_entropy_with_logits(pred_probs, labels)
 
         optimizer.zero_grad()
         loss_val.backward()
         optimizer.step()
 
-        epoch_loss += loss_val.item()
-        num_items += 1
+        total_loss += loss_val.item()
+        total_pairs += 1
 
-    avg_train_loss = epoch_loss / max(num_items, 1)
+    avg_train_loss = total_loss / max(total_pairs, 1)
     print(f"[Epoch {epoch+1}] Train Loss = {avg_train_loss:.6f}")
-
     # --- Evaluate every 10 epochs ---
     test_loss = None
     if (epoch + 1) % 10 == 0:
@@ -579,9 +1088,15 @@ def train_randompairs_epoch(
                 i_idx_test = pair_indices_test // N_test
                 j_idx_test = pair_indices_test % N_test
 
-                valid_mask_test = (i_idx_test != j_idx_test)
-                i_idx_test = i_idx_test[valid_mask_test]
-                j_idx_test = j_idx_test[valid_mask_test]
+
+                if skip_equal:
+                    # 3) Skip pairs where the scores are equal
+                    score_i = all_scores[i_idx_test]
+                    score_j = all_scores[j_idx_test]
+                    valid_mask_test =  (score_i != score_j)
+                    
+                    i_idx_test = i_idx_test[valid_mask_test]
+                    j_idx_test = j_idx_test[valid_mask_test]
 
                 if i_idx_test.size(0) == 0:
                     continue
@@ -592,10 +1107,10 @@ def train_randompairs_epoch(
 
    
                 image_batch_test = image_emb.repeat(labels_test.size(0), 1, 1, 1, 1)
-                pred_test_probs = model(image_batch_test, g_i_test, g_j_test)
+                pred_test_probs,_ = model(image_batch_test, g_i_test, g_j_test)
             
 
-                loss_test_val = F.binary_cross_entropy(pred_test_probs, labels_test)
+                loss_test_val = F.binary_cross_entropy_with_logits(pred_test_probs, labels_test)
                 total_test_loss += loss_test_val.item()
                 num_test_items += 1
 
@@ -606,3 +1121,5 @@ def train_randompairs_epoch(
         print(f"# # # # Test Loss = {test_loss:.6f} # # # #")
 
     return avg_train_loss, test_loss
+
+
