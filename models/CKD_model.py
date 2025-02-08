@@ -997,7 +997,7 @@ class Encoder_patch(nn.Module):
         t2_2 , t2= self.patch_embed_t2(t2)
         flair_2, flair = self.patch_embed_flair(flair)
 
-        return torch.cat([t1, t1ce, t2, flair], dim=1)
+        return (t1_2, t1ce_2, t2_2, flair_2),(t1, t1ce, t2, flair)
 
 class CKD_pathes(nn.Module):
     def __init__(self, embed_dim, output_dim, img_size, patch_size, in_chans, depths, num_heads, window_size, mlp_ratio):
@@ -1007,6 +1007,6 @@ class CKD_pathes(nn.Module):
         self.decoder = Decoder(output_dim=output_dim, embed_dim=embed_dim*32)
     def forward(self, inputs):
         t1, t1ce, t2, flair = inputs[:,0,:,:,:].unsqueeze(1), inputs[:,1,:,:,:].unsqueeze(1), inputs[:,2,:,:,:].unsqueeze(1), inputs[:,3,:,:,:].unsqueeze(1)
-        t1_after, t1ce_after, t2_after, flair_after = self.encoder(t1, t1ce, t2, flair)
+        (t1_2, t1ce_2, t2_2, flair_2),(t1, t1ce, t2, flair) = self.encoder(t1, t1ce, t2, flair)
 
-        return t1_after, t1ce_after, t2_after, flair_after
+        return (t1_2, t1ce_2, t2_2, flair_2),(t1, t1ce, t2, flair)
