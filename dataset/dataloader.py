@@ -359,6 +359,118 @@ class BrainDataset(Dataset):
     
     
 
+class BrainDataset_light(Dataset):
+    def __init__(self, t1_paths, t1gd_paths, t2_paths, flair_paths, label_paths, 
+                 transforms=None, is_train=True, **kwargs):
+        """
+        Args:
+            t1_paths:       List of paths to T1 NIfTI files
+            t1gd_paths:     List of paths to T1Gd NIfTI files
+            t2_paths:       List of paths to T2 NIfTI files
+            flair_paths:    List of paths to FLAIR NIfTI files
+            label_paths:    List of paths to label NIfTI files
+            transforms:     Data augmentations
+            is_train:       Boolean indicating training or testing mode
+        """
+        self.t1_paths = t1_paths
+        self.t1gd_paths = t1gd_paths
+        self.t2_paths = t2_paths
+        self.flair_paths = flair_paths
+        self.label_paths = label_paths
+        self.transforms = transforms
+        self.is_train = is_train
+
+        self.modalities = ['t1', 't1gd', 't2', 'flair']
+
+        # Define the label mapping here
+        self.class_mapping = {0: 0, 1: 1, 2: 2, 4: 3}  # Map class 4 to index 3
+
+        self.dataset = []
+        self.build_dataset()
+
+    def build_dataset(self):
+        for idx in range(len(self.t1_paths)):
+            # Load the volumes
+            t1_img    = nib.load(self.t1_paths[idx]).get_fdata()
+            t1gd_img  = nib.load(self.t1gd_paths[idx]).get_fdata()
+            t2_img    = nib.load(self.t2_paths[idx]).get_fdata()
+            flair_img = nib.load(self.flair_paths[idx]).get_fdata()
+            label_img = nib.load(self.label_paths[idx]).get_fdata()
+
+            # Stack the modalities into one array to find the non-zero region (shape: [4, D, H, W])
+            patient_image = np.stack([t1_img, t1gd_img, t2_img, flair_img], axis=0)
+
+            # Identify the bounding box around non-zero voxels
+            mask = np.sum(patient_image, axis=0) != 0
+            z_idxs, y_idxs, x_idxs = np.nonzero(mask)
+
+            # Compute bounding box with a 1-voxel margin, ensuring indices don't go below 0
+            zmin = max(0, np.min(z_idxs) - 1)
+            zmax = np.max(z_idxs) + 1
+            ymin = max(0, np.min(y_idxs) - 1)
+            ymax = np.max(y_idxs) + 1
+            xmin = max(0, np.min(x_idxs) - 1)
+            xmax = np.max(x_idxs) + 1
+
+            # Crop each modality
+            t1_img    = t1_img[zmin:zmax, ymin:ymax, xmin:xmax]
+            t1gd_img  = t1gd_img[zmin:zmax, ymin:ymax, xmin:xmax]
+            t2_img    = t2_img[zmin:zmax, ymin:ymax, xmin:xmax]
+            flair_img = flair_img[zmin:zmax, ymin:ymax, xmin:xmax]
+            label_img = label_img[zmin:zmax, ymin:ymax, xmin:xmax]
+          
+            # Center-crop (with padding if needed)
+            t1_img    = center_crop_3d_with_padding_numpy(t1_img)
+            t1gd_img  = center_crop_3d_with_padding_numpy(t1gd_img)
+            t2_img    = center_crop_3d_with_padding_numpy(t2_img)
+            flair_img = center_crop_3d_with_padding_numpy(flair_img)
+            label_img = center_crop_3d_with_padding_numpy(label_img)
+
+            data_dict = {
+                't1': t1_img,
+                't1gd': t1gd_img,
+                't2': t2_img,
+                'flair': flair_img,
+                'label': label_img,
+                'patient_idx': idx+1
+            }
+            self.dataset.append(data_dict)
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        data_dict = self.dataset[index]
+
+        # Get the images and label
+        t1_data = data_dict['t1']
+        t1gd_data = data_dict['t1gd']
+        t2_data = data_dict['t2']
+        flair_data = data_dict['flair']
+        label_data = data_dict['label']
+       
+
+
+        t1_data = normalize( t1_data )
+        t1gd_data = normalize( t1gd_data )
+        t2_data = normalize(  t2_data )
+        flair_data = normalize( flair_data  )
+
+        
+        data = {
+            'img': {
+                    't1': t1_data,
+                    't1gd': t1gd_data,
+                    't2': t2_data,
+                    'flair_data': flair_data,
+                    'label_img' : label_data 
+            }
+        }
+
+        return data
+    
+    
+    
 
 def load_from_hdf5(group, keys_to_load=None):
     result = {}
@@ -411,3 +523,7 @@ class HDF5BrainDataset(Dataset):
             data = load_from_hdf5(hf, keys_to_load=keys_to_load)
 
         return data
+
+
+
+
