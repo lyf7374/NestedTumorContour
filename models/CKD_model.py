@@ -922,3 +922,91 @@ class CKD_encoder_only(nn.Module):
         z1, z2, z3, z4, z5 = self.encoder(t1, t1ce, t2, flair)
 
         return z5
+
+class CKD_encoder_multi(nn.Module):
+    def __init__(self, embed_dim, output_dim, img_size, patch_size, in_chans, depths, num_heads, window_size, mlp_ratio):
+        super().__init__()
+        self.encoder = Encoder(embed_dim=embed_dim, img_size=img_size, patch_size=patch_size, in_chans=in_chans, 
+                               depths=depths, num_heads=num_heads, window_size=window_size, mlp_ratio=mlp_ratio)
+        self.decoder = Decoder(output_dim=output_dim, embed_dim=embed_dim*32)
+    def forward(self, inputs):
+        t1, t1ce, t2, flair = inputs[:,0,:,:,:].unsqueeze(1), inputs[:,1,:,:,:].unsqueeze(1), inputs[:,2,:,:,:].unsqueeze(1), inputs[:,3,:,:,:].unsqueeze(1)
+        z1, z2, z3, z4, z5 = self.encoder(t1, t1ce, t2, flair)
+
+        return z1,z2,z3,z4,z5
+    
+
+
+
+
+
+    
+class Encoder_patch(nn.Module):
+
+    def __init__(self, embed_dim=32, img_size=(128, 128, 128), patch_size=(4, 4, 4), in_chans=1, 
+                  depths=[2, 2, 2], num_heads=[2, 4, 8, 16], window_size=(7, 7, 7), mlp_ratio=4.,
+                 qkv_bias=True, qk_scale=None, drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm, 
+                 patch_norm=True
+                ):
+        super().__init__()
+
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_norm = patch_norm
+        self.num_features = int(embed_dim * 2 ** (self.num_layers - 1))
+        self.mlp_ratio = mlp_ratio
+        self.window_size = window_size
+        # split image into non-overlapping patches
+        self.patch_embed_t1 = PatchEmbed3D(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        self.patch_embed_t1ce = PatchEmbed3D(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        self.patch_embed_t2 = PatchEmbed3D(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+        self.patch_embed_flair = PatchEmbed3D(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim, norm_layer=norm_layer if self.patch_norm else None)
+
+        self.patches_resolution = self.patch_embed_t1.patches_resolution
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        # stochastic depth
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
+
+        # build encoder and bottleneck layers
+        self.layers = nn.ModuleList()
+        for i_layer in range(self.num_layers):
+            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer), depth=depths[i_layer], depths=depths, num_heads=num_heads[i_layer],
+                window_size=window_size, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                drop_path_rate=drop_path_rate, norm_layer=norm_layer, downsample=PatchMerging)
+            self.layers.append(layer)
+        
+        self.bottleneck = nn.ModuleList([
+            BottleneckBlock3D(
+                dim=(embed_dim * 2 ** (i_layer+1))*4, num_heads=num_heads[i_layer+1], window_size=window_size, shift_size=(0, 0, 0),
+                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, norm_layer=norm_layer),
+            BottleneckBlock3D(
+                dim=(embed_dim * 2 ** (i_layer+1))*4, num_heads=num_heads[i_layer+1], window_size=window_size, shift_size=tuple(i//2 for i in window_size),
+                mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate, attn_drop=attn_drop_rate, norm_layer=norm_layer
+            )
+        ])
+        self.norm = norm_layer((embed_dim * 2 ** (i_layer+1))*4)
+
+
+    def forward(self, t1, t1ce, t2, flair):
+        extract_feature = []
+        t1_2, t1 = self.patch_embed_t1(t1)
+        t1ce_2, t1ce = self.patch_embed_t1ce(t1ce)
+        t2_2 , t2= self.patch_embed_t2(t2)
+        flair_2, flair = self.patch_embed_flair(flair)
+
+        return torch.cat([t1, t1ce, t2, flair], dim=1)
+
+class CKD_pathes(nn.Module):
+    def __init__(self, embed_dim, output_dim, img_size, patch_size, in_chans, depths, num_heads, window_size, mlp_ratio):
+        super().__init__()
+        self.encoder = Encoder_patch(embed_dim=embed_dim, img_size=img_size, patch_size=patch_size, in_chans=in_chans, 
+                               depths=depths, num_heads=num_heads, window_size=window_size, mlp_ratio=mlp_ratio)
+        self.decoder = Decoder(output_dim=output_dim, embed_dim=embed_dim*32)
+    def forward(self, inputs):
+        t1, t1ce, t2, flair = inputs[:,0,:,:,:].unsqueeze(1), inputs[:,1,:,:,:].unsqueeze(1), inputs[:,2,:,:,:].unsqueeze(1), inputs[:,3,:,:,:].unsqueeze(1)
+        t1_after, t1ce_after, t2_after, flair_after = self.encoder(t1, t1ce, t2, flair)
+
+        return t1_after, t1ce_after, t2_after, flair_after
