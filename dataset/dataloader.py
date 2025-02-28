@@ -5,6 +5,9 @@ import os
 import h5py
 import torch
 from torch.utils.data import DataLoader
+from utils.CT_sampling_support import (
+        convert2diploar, extract_boundary, spherical_to_cartesian,r_max_region,fps,equally_sampling_spherical,calculate_centroid
+)
 
 def normalize(volume, method = 'mm'):
     """Normalize the volume
@@ -486,14 +489,14 @@ class BrainDataset_WTonly(Dataset):
             t2_img    = t2_img[zmin:zmax, ymin:ymax, xmin:xmax]
             flair_img = flair_img[zmin:zmax, ymin:ymax, xmin:xmax]
             label_img = label_img[zmin:zmax, ymin:ymax, xmin:xmax]
-          
+            center_TC = calculate_centroid(label_img)
             # Center-crop (with padding if needed)
-            t1_img    = center_crop_3d_with_padding_numpy(t1_img)
-            t1gd_img  = center_crop_3d_with_padding_numpy(t1gd_img)
-            t2_img    = center_crop_3d_with_padding_numpy(t2_img)
-            flair_img = center_crop_3d_with_padding_numpy(flair_img)
-            label_img = center_crop_3d_with_padding_numpy(label_img)
-
+            t1_img    = center_crop_3d_with_padding_numpy_with_center(t1_img,center=center_TC)
+            t1gd_img  = center_crop_3d_with_padding_numpy_with_center(t1gd_img,center=center_TC)
+            t2_img    = center_crop_3d_with_padding_numpy_with_center(t2_img,center=center_TC)
+            flair_img = center_crop_3d_with_padding_numpy_with_center(flair_img,center=center_TC)
+            label_img = center_crop_3d_with_padding_numpy_with_center(label_img,center=center_TC)
+            self.pre_center = center_TC
             data_dict = {
                 't1': t1_img,
                 't1gd': t1gd_img,
@@ -517,11 +520,7 @@ class BrainDataset_WTonly(Dataset):
         flair_data = data_dict['flair']
         label_data = data_dict['label']
         patient_idx = data_dict['patient_idx']
-        from utils.CT_sampling_support import (
-             convert2diploar, extract_boundary,
-            spherical_to_cartesian, shrink_or_expand_points, clip_points_within_radius,r_max_region,fps,
-            contour_transition_equally, equally_sampling, get_values_at_coords, get_patches_at_coords,equally_sampling_spherical,calculate_centroid
-        )
+
 
         # Define parameters
         n_regions_theta = 128  # Number of theta bins
@@ -618,6 +617,7 @@ class BrainDataset_WTonly(Dataset):
                         'ht':HT_points_xyz
                 
             },
+            'center_pre':  self.pre_center,
             'center':  center_TC,
             'patient_idx': patient_idx
         }
