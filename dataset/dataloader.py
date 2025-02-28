@@ -162,7 +162,76 @@ def center_crop_3d_with_padding_numpy(img, crop_size=(128,128,128), pad_value=0)
 
     return cropped_img
 
+def center_crop_3d_with_padding_numpy_with_center(img, crop_size=(128,128,128), pad_value=0, center=None):
+    """
+    Crops a 3D NumPy array to the specified crop_size based on a given center.
+    If the crop extends outside the image boundaries, the function pads with pad_value.
 
+    Parameters:
+    - img (numpy.ndarray): Input array of shape (D, H, W).
+    - crop_size (tuple): Desired output size (crop_d, crop_h, crop_w).
+    - pad_value (float, optional): Value to use for padding. Default is 0.
+    - center (tuple, optional): Center coordinate (center_d, center_h, center_w). 
+                                If None, defaults to the center of the image.
+
+    Returns:
+    - numpy.ndarray: Cropped (and possibly padded) array of shape (crop_d, crop_h, crop_w).
+    """
+    # Input Validation
+    if not isinstance(img, np.ndarray):
+        raise TypeError("Input img must be a numpy.ndarray.")
+    if img.ndim != 3:
+        raise ValueError(f"Expected 3D array (D, H, W), but got {img.ndim}D array.")
+    if not isinstance(crop_size, (tuple, list)) or len(crop_size) != 3:
+        raise ValueError("crop_size must be a tuple or list of three integers (crop_d, crop_h, crop_w).")
+    
+    D, H, W = img.shape
+    crop_d, crop_h, crop_w = crop_size
+    if crop_d <= 0 or crop_h <= 0 or crop_w <= 0:
+        raise ValueError("All elements of crop_size must be positive integers.")
+
+    # If center is not provided, default to the image center.
+    if center is None:
+        center = (D // 2, H // 2, W // 2)
+    else:
+        if not (isinstance(center, (tuple, list)) and len(center) == 3):
+            raise ValueError("center must be a tuple or list of three numbers (center_d, center_h, center_w).")
+        # Ensure center coordinates are integers.
+        center = tuple(int(round(c)) for c in center)
+    
+    # Compute starting and ending indices for each dimension.
+    s_d = center[0] - crop_d // 2
+    s_h = center[1] - crop_h // 2
+    s_w = center[2] - crop_w // 2
+    e_d = s_d + crop_d
+    e_h = s_h + crop_h
+    e_w = s_w + crop_w
+
+    # Compute the necessary padding for each dimension.
+    pad_d_before = max(0, -s_d)
+    pad_h_before = max(0, -s_h)
+    pad_w_before = max(0, -s_w)
+    
+    pad_d_after = max(0, e_d - D)
+    pad_h_after = max(0, e_h - H)
+    pad_w_after = max(0, e_w - W)
+    
+    # Apply padding if needed.
+    if any([pad_d_before, pad_d_after, pad_h_before, pad_h_after, pad_w_before, pad_w_after]):
+        padding = (
+            (pad_d_before, pad_d_after),
+            (pad_h_before, pad_h_after),
+            (pad_w_before, pad_w_after)
+        )
+        img = np.pad(img, pad_width=padding, mode='constant', constant_values=pad_value)
+        # Adjust start indices to account for padding.
+        s_d += pad_d_before
+        s_h += pad_h_before
+        s_w += pad_w_before
+
+    # Perform cropping.
+    cropped_img = img[s_d:s_d+crop_d, s_h:s_h+crop_h, s_w:s_w+crop_w]
+    return cropped_img
 class BrainDataset(Dataset):
     def __init__(self, t1_paths, t1gd_paths, t2_paths, flair_paths, label_paths, 
                  transforms=None, is_train=True, **kwargs):
