@@ -34,8 +34,10 @@ def calculate_centroid(label):
     # Compute the center of mass
     centroid = center_of_mass(mask)
     return centroid
-def convert2diploar(label):
-    center_TC = calculate_centroid(label)
+
+def convert2diploar(label, center_TC=None):
+    if center_TC is None:
+        center_TC = calculate_centroid(label)
     center_x, center_y, center_z = center_TC
 
     # Generate the x, y, z coordinate grids
@@ -224,11 +226,11 @@ def spherical_to_cartesian(sph_coords):
 
 
 
-def r_max_region(select_points):
+def r_max_region(select_points,n_regions_theta = 128,n_regions_phi = 128 ):
     
 
-    n_regions_theta = 128  # Number of theta bins
-    n_regions_phi = 128    # Number of phi bins
+      # Number of theta bins
+       # Number of phi bins
     theta_bins = np.linspace(0, 2*np.pi, n_regions_theta + 1)
     phi_bins = np.linspace(0, np.pi, n_regions_phi + 1)  
     
