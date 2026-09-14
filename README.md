@@ -4,7 +4,7 @@ Code for learning pairwise tumor-contour rankings and generating nested contour 
 
 - [Ranking Model](Ranking%20Model/): contour comparator, pairwise training, and validation-based checkpoint selection.
 - [Nested Inference](Nested%20Inference/): ranking-guided contour shrinkage, multiple initializations, and aggregation into voxelwise ordinal maps.
-- [PredictGBM preprocessing](PredictGBM_main/README.md): MRI registration, skull stripping, and tumor/tissue segmentation. Existing contour utilities are in [Preprocess](Preprocess/).
+- [MRI preprocessing](PredictGBM_main/README.md): MRI registration, skull stripping, and tumor/tissue segmentation. Existing contour utilities are in [Preprocess](Preprocess/).
 
 ## Setup
 
@@ -116,6 +116,6 @@ Add `--validate-only` to check the NIfTI inputs without running inference. Both 
 
 Each case directory contains per-initialization contours, search histories, and run status. `aggregate_multi_init/` contains the mean and standard deviation of the voxelwise ordinal maps in `.npy` and `.nii.gz` formats. These values describe within-patient ordering; they are not calibrated infiltration probabilities.
 
-## Preprocessing attribution
+## MRI preprocessing
 
-The preprocessing component is adapted from [BrainLesion/PredictGBM](https://github.com/BrainLesion/PredictGBM). Its documentation, acknowledgments, and [Apache 2.0 license](PredictGBM_main/LICENCE) are retained in `PredictGBM_main/`.
+Our preprocessing pipeline prepares T1, T1CE, T2, and FLAIR images for ContourRank through intensity normalization, skull stripping, within-patient co-registration, and atlas alignment. Tumor segmentations and gray- and white-matter probability maps provide the anatomical inputs for contour initialization and tissue-guided shrinkage. The implementation is available in [PredictGBM_main](PredictGBM_main/).
